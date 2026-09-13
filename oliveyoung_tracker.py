@@ -8,19 +8,6 @@ from playwright.sync_api import sync_playwright
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 TOKEN       = os.environ.get("TOKEN", "")
 
-PRODUCTS = [
-    {"name": "크림랩핑마스크 5+1",          "goodsNo": "A000000240462"},
-    {"name": "메디힐 시트 마스크",           "goodsNo": "A000000223414"},
-    {"name": "바이오던스 7+1",              "goodsNo": "A000000261842"},
-    {"name": "메노킨 버블 마스크",           "goodsNo": "A000000234422"},
-    {"name": "TXA 크림",                   "goodsNo": "A000000253592"},
-    {"name": "에스네이처 스쿠알란 수분크림",   "goodsNo": "A000000263782"},
-    {"name": "구달 청귤 비타C 세럼",         "goodsNo": "A000000263562"},
-    {"name": "선크림 50+50",               "goodsNo": "A000000254726"},
-    {"name": "메디힐 선세럼 50+50",         "goodsNo": "A000000232672"},
-    {"name": "구달 어성초 수분선크림 50+50",  "goodsNo": "A000000263555"},
-]
-
 URL = "https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo={}"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
@@ -28,6 +15,11 @@ VIEW_RE = re.compile(r"([\d,]+)\s*명이\s*보고\s*있어요")
 
 def now_seoul():
     return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
+
+def get_products():
+    """시트의 '제품설정' 탭에서 제품 목록을 읽어온다."""
+    r = requests.get(WEBHOOK_URL, params={"token": TOKEN}, timeout=30)
+    return r.json().get("products", [])
 
 def read_count(page, goods_no):
     page.goto(URL.format(goods_no), wait_until="domcontentloaded", timeout=40000)
@@ -39,29 +31,46 @@ def read_count(page, goods_no):
     return None
 
 def main():
+    if not WEBHOOK_URL.startswith("http"):
+        print("WEBHOOK_URL 미설정"); return
+
+    products = get_products()
+    print(f"제품설정에서 {len(products)}개 불러옴")
+    if not products:
+        print("제품 목록이 비어있음 (제품설정 탭 확인)"); return
+
+    # 같은 상품번호는 한 번만 크롤링 → 여러 이름(블록)에 같은 값 기록 (겹치는 제품 처리)
+    by_goods = {}
+    for p in products:
+        g = p.get("goodsNo")
+        if not g:
+            continue
+        by_goods.setdefault(g, []).append(p["name"])
+
     rows = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+    ts = now_seoul()
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = browser.new_context(user_agent=UA, locale="ko-KR", viewport={"width": 1440, "height": 900})
         page = ctx.new_page()
-        for prod in PRODUCTS:
+        for goods_no, names in by_goods.items():
             cnt = None
             try:
-                cnt = read_count(page, prod["goodsNo"])
+                cnt = read_count(page, goods_no)
             except Exception as e:
-                print(f"[{prod['name']}] 오류: {e}")
-            print(f"[{prod['name']}] {cnt}")
-            rows.append({"time": now_seoul(), "name": prod["name"], "goodsNo": prod["goodsNo"], "count": cnt if cnt is not None else ""})
+                print(f"[{goods_no}] 오류: {e}")
+            print(f"[{goods_no}] {cnt}  -> {', '.join(names)}")
+            for name in names:
+                rows.append({"time": ts, "name": name, "goodsNo": goods_no,
+                             "count": cnt if cnt is not None else ""})
             time.sleep(1)
         browser.close()
-    if WEBHOOK_URL.startswith("http"):
-        try:
-            r = requests.post(WEBHOOK_URL, json={"token": TOKEN, "rows": rows}, timeout=30)
-            print("시트 전송:", r.status_code, r.text[:200])
-        except Exception as e:
-            print("시트 전송 실패:", e)
-    else:
-        print("WEBHOOK_URL 미설정")
+
+    try:
+        r = requests.post(WEBHOOK_URL, json={"token": TOKEN, "rows": rows}, timeout=30)
+        print("시트 전송:", r.status_code, r.text[:200])
+    except Exception as e:
+        print("시트 전송 실패:", e)
 
 if __name__ == "__main__":
     main()
