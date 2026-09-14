@@ -22,12 +22,20 @@ def get_products():
     return r.json().get("products", [])
 
 def read_count(page, goods_no):
-    page.goto(URL.format(goods_no), wait_until="domcontentloaded", timeout=40000)
-    for _ in range(3):
-        page.wait_for_timeout(2500)
-        m = VIEW_RE.search(page.inner_text("body"))
-        if m:
-            return int(m.group(1).replace(",", ""))
+    for attempt in range(2):                 # 페이지 로드 최대 2번 시도
+        try:
+            page.goto(URL.format(goods_no), wait_until="domcontentloaded", timeout=40000)
+        except Exception:
+            page.wait_for_timeout(2000)
+            continue
+        for _ in range(5):                    # 로드 후 최대 5번(약 15초) 재확인
+            page.wait_for_timeout(3000)
+            try:
+                m = VIEW_RE.search(page.inner_text("body"))
+            except Exception:
+                continue
+            if m:
+                return int(m.group(1).replace(",", ""))
     return None
 
 def main():
