@@ -2,7 +2,7 @@ name: olive tracker
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17,47 * * * *"
 jobs:
   run:
     runs-on: ubuntu-latest
