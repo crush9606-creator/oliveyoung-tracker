@@ -14,11 +14,40 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 # 올리브영이 상세페이지를 JS 렌더링(Next.js)으로 바꾸면서 "N명이 보고 있어요" 숫자가
 # HTML에 더 이상 안 박힘 → 실시간 조회자 API(rts)를 직접 호출해서 값을 가져온다.
-#  (1) 상품페이지 HTML에서 대표 옵션의 표준코드(바코드) 추출
-#  (2) rts.ai API를 호출해 item.count(현재 동시 조회자) 수신
-RTS = "https://rts.ai.oliveyoung.co.kr/api/stat?itemid={}&type=view&cuid={}"
-CUID = str(uuid.uuid4())                      # 실행 1회당 클라이언트 식별자 1개
-VIEW_RE = re.compile(r"([\d,]+)\s*명이\s*보고\s*있어요")   # 혹시 모를 폴백용
+#   (1) 상품 HTML에서 대표 옵션의 표준코드(바코드) 추출
+#   (2) rts.ai API 호출 → item.count(현재 동시 조회자)
+# 봇차단(클라우드플레어)에 안 걸리도록, 매 제품마다 페이지를 통째로 열지 않고
+# 처음 1회만 goto로 통과시킨 뒤 나머지는 브라우저 내부 fetch(사이트가 쓰는 그 방식)로 처리.
+CUID = str(uuid.uuid4())
+VIEW_RE = re.compile(r"([\d,]+)\s*명이\s*보고\s*있어요")   # 폴백용
+
+# 브라우저 안에서 실행: 상품 HTML fetch → 바코드 추출 → rts API fetch → count 반환
+JS_FETCH = r"""
+async ([gno, cuid]) => {
+  const dig = /"standardCode":"(\d{8,14})"/g;
+  try {
+    const h = await fetch(
+      `https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo=${gno}`,
+      { credentials: 'include' }).then(r => r.text());
+    const s = h.split('\\"').join('"');
+    let bc = null;
+    const i = s.indexOf('"representFlag":true');
+    if (i >= 0) {
+      const win = s.slice(Math.max(0, i - 500), i);
+      const ms = [...win.matchAll(dig)];
+      if (ms.length) bc = ms[ms.length - 1][1];
+    }
+    if (!bc) { const m = s.match(/"standardCode":"(\d{8,14})"/); if (m) bc = m[1]; }
+    if (!bc) return null;
+    const r = await fetch(
+      `https://rts.ai.oliveyoung.co.kr/api/stat?itemid=${bc}&type=view&cuid=${cuid}`,
+      { headers: { 'accept': 'application/json' } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return (j && j.item && typeof j.item.count !== 'undefined') ? j.item.count : null;
+  } catch (e) { return null; }
+}
+"""
 
 def now_seoul():
     return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
@@ -30,25 +59,37 @@ def get_products():
 
 def rep_barcode(html):
     """상품 HTML에서 대표 옵션(representFlag:true)의 표준코드(바코드)를 뽑는다."""
-    s = html.replace('\\"', '"')               # RSC 이스케이프(\") 해제
+    s = html.replace('\\"', '"')
     idx = s.find('"representFlag":true')
-    if idx >= 0:                               # 대표 옵션 직전의 표준코드
+    if idx >= 0:
         win = s[max(0, idx - 500):idx]
         ms = re.findall(r'"standardCode":"(\d{8,14})"', win)
         if ms:
             return ms[-1]
-    m = re.search(r'"standardCode":"(\d{8,14})"', s)   # 폴백: 첫 표준코드
+    m = re.search(r'"standardCode":"(\d{8,14})"', s)
     return m.group(1) if m else None
 
-def read_count(page, goods_no):
-    for attempt in range(2):                   # 페이지 로드 최대 2번 시도
+def via_fetch(page, goods_no):
+    """가벼운 방식: 브라우저 내부 fetch로 바코드+조회자 수를 한 번에."""
+    try:
+        v = page.evaluate(JS_FETCH, [goods_no, CUID])
+    except Exception:
+        v = None
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+def via_page(page, goods_no):
+    """폴백: 실제로 페이지를 열어 바코드 추출 후 rts 호출."""
+    for attempt in range(2):
         try:
             page.goto(URL.format(goods_no), wait_until="domcontentloaded", timeout=40000)
         except Exception:
             page.wait_for_timeout(2000)
             continue
-
-        # 바코드는 서버 HTML(초기 렌더)에 들어있음 → 최대 3번만 짧게 재확인
         barcode = None
         for _ in range(3):
             barcode = rep_barcode(page.content())
@@ -56,9 +97,7 @@ def read_count(page, goods_no):
                 break
             page.wait_for_timeout(1500)
         if not barcode:
-            continue                           # 바코드 못 찾으면 다음 시도
-
-        # 브라우저 안에서 실시간 조회자 API 호출(올영 페이지가 쓰는 그 호출)
+            continue
         try:
             cnt = page.evaluate(
                 """async ([bc, cuid]) => {
@@ -68,22 +107,18 @@ def read_count(page, goods_no):
                           { headers: { 'accept': 'application/json' } });
                         if (!r.ok) return null;
                         const j = await r.json();
-                        return (j && j.item && typeof j.item.count !== 'undefined')
-                                 ? j.item.count : null;
+                        return (j && j.item && typeof j.item.count !== 'undefined') ? j.item.count : null;
                     } catch (e) { return null; }
                 }""",
                 [barcode, CUID]
             )
         except Exception:
             cnt = None
-
         if cnt is not None:
             try:
                 return int(cnt)
             except Exception:
                 return None
-
-        # 폴백: 혹시 화면에 숫자가 렌더됐으면 텍스트에서라도 긁어본다(짧게)
         try:
             page.wait_for_timeout(2000)
             m = VIEW_RE.search(page.inner_text("body"))
@@ -93,6 +128,16 @@ def read_count(page, goods_no):
             pass
         return None
     return None
+
+def read_count(page, goods_no):
+    # 1) 가벼운 fetch 방식 (최대 2번)
+    for _ in range(2):
+        v = via_fetch(page, goods_no)
+        if v is not None:
+            return v
+        page.wait_for_timeout(1000)
+    # 2) 폴백: 실제 페이지 로드
+    return via_page(page, goods_no)
 
 def main():
     if not WEBHOOK_URL.startswith("http"):
@@ -117,6 +162,16 @@ def main():
         browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = browser.new_context(user_agent=UA, locale="ko-KR", viewport={"width": 1440, "height": 900})
         page = ctx.new_page()
+
+        # 최초 1회: 실제 페이지를 열어 올영 봇차단(클라우드플레어) 통과(쿠키 획득)
+        first = next(iter(by_goods), None)
+        if first:
+            try:
+                page.goto(URL.format(first), wait_until="domcontentloaded", timeout=40000)
+                page.wait_for_timeout(3000)
+            except Exception:
+                pass
+
         for goods_no, names in by_goods.items():
             cnt = None
             try:
