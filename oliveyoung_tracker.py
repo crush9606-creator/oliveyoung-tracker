@@ -53,9 +53,17 @@ def now_seoul():
     return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
 
 def get_products():
-    """시트의 '제품설정' 탭에서 제품 목록을 읽어온다."""
-    r = requests.get(WEBHOOK_URL, params={"token": TOKEN}, timeout=30)
-    return r.json().get("products", [])
+    """시트의 '제품설정' 탭에서 제품 목록을 읽어온다. (구글 응답 지연 대비 재시도)"""
+    last = None
+    for attempt in range(3):
+        try:
+            r = requests.get(WEBHOOK_URL, params={"token": TOKEN}, timeout=60)
+            return r.json().get("products", [])
+        except Exception as e:
+            last = e
+            time.sleep(5)
+    print("제품목록 불러오기 실패(doGet 응답 지연):", last)
+    return []
 
 def rep_barcode(html):
     """상품 HTML에서 대표 옵션(representFlag:true)의 표준코드(바코드)를 뽑는다."""
@@ -119,6 +127,7 @@ def via_page(page, goods_no):
                 return int(cnt)
             except Exception:
                 return None
+        # 폴백의 폴백: 화면 텍스트에서라도
         try:
             page.wait_for_timeout(2000)
             m = VIEW_RE.search(page.inner_text("body"))
@@ -185,11 +194,14 @@ def main():
             time.sleep(1)
         browser.close()
 
-    try:
-        r = requests.post(WEBHOOK_URL, json={"token": TOKEN, "rows": rows}, timeout=30)
-        print("시트 전송:", r.status_code, r.text[:200])
-    except Exception as e:
-        print("시트 전송 실패:", e)
+    for attempt in range(3):
+        try:
+            r = requests.post(WEBHOOK_URL, json={"token": TOKEN, "rows": rows}, timeout=60)
+            print("시트 전송:", r.status_code, r.text[:200])
+            break
+        except Exception as e:
+            print(f"시트 전송 재시도({attempt+1}/3):", e)
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
